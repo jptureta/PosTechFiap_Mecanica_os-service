@@ -51,3 +51,38 @@ resource "aws_db_instance" "service" {
   final_snapshot_identifier  = var.environment == "production" ? "oficina-os-production-final" : null
   auto_minor_version_upgrade = true
 }
+
+resource "aws_sqs_queue" "os_events_dlq" {
+  name                        = "oficina-os-events-${var.environment}-dlq.fifo"
+  fifo_queue                  = true
+  content_based_deduplication = true
+  message_retention_seconds   = 1209600
+}
+
+resource "aws_sqs_queue" "os_events" {
+  name                        = "oficina-os-events-${var.environment}.fifo"
+  fifo_queue                  = true
+  content_based_deduplication = true
+  visibility_timeout_seconds  = 30
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.os_events_dlq.arn
+    maxReceiveCount     = 3
+  })
+}
+
+resource "aws_dynamodb_table" "diagnostics" {
+  name         = "oficina-os-diagnostics-${var.environment}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "order_id"
+  range_key    = "diagnostic_id"
+
+  attribute {
+    name = "order_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "diagnostic_id"
+    type = "S"
+  }
+}

@@ -12,6 +12,13 @@ services:
       retries: 10
     volumes:
       - os_data:/var/lib/postgresql/data
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs,dynamodb
+      AWS_DEFAULT_REGION: us-east-1
   os-service:
     build: .
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
@@ -24,8 +31,20 @@ services:
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-only-change-me}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-local-only-change-me}
       JWT_ALGORITHM: HS256
+      MESSAGING_ENABLED: ${MESSAGING_ENABLED:-false}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_ENDPOINT_URL: http://localstack:4566
+      DYNAMODB_ENDPOINT_URL: http://localstack:4566
+      DIAGNOSTICS_TABLE_NAME: oficina-os-diagnostics
+      OS_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/oficina-os-events.fifo
+      BILLING_COMMANDS_QUEUE_URL: http://localstack:4566/000000000000/oficina-billing-commands.fifo
+      INVENTORY_COMMANDS_QUEUE_URL: http://localstack:4566/000000000000/oficina-inventory-commands.fifo
     depends_on:
       db:
         condition: service_healthy
+      localstack:
+        condition: service_started
 volumes:
   os_data:
