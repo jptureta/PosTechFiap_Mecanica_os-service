@@ -1,4 +1,4 @@
-Feature: Fluxo distribuído de Ordem de Serviço com Saga Orquestrada via SQS
+Feature: Fluxo distribuído de Ordem de Serviço com Saga Orquestrada via RabbitMQ
   Como cliente e equipe operacional da oficina mecânica
   Desejo que a abertura, orçamento, aprovação, pagamento, reserva de estoque, execução e entrega de uma OS sejam coordenados de forma transacional
   Para garantir consistência eventual e compensação automática em caso de falhas
@@ -6,7 +6,7 @@ Feature: Fluxo distribuído de Ordem de Serviço com Saga Orquestrada via SQS
   Scenario: Fluxo completo de uma OS até a entrega com diagnóstico NoSQL
     Given o catálogo possui a peça "filtro-oleo" ao preço "45.00" e o serviço "troca-oleo" ao preço "80.00"
     When o cliente "cli-10" abre uma OS para o veículo "ABC-1234" com 1 peça "filtro-oleo" e 1 serviço "troca-oleo"
-    And o relay da outbox publica os comandos pendentes no SQS
+    And o relay da outbox publica os comandos pendentes no RabbitMQ
     And o Billing processa a criação do orçamento e emite o evento QuoteCreated
     And o cliente aprova o orçamento gerando o evento QuoteApproved
     And o pagamento "pay-99" é confirmado gerando o evento PaymentConfirmed

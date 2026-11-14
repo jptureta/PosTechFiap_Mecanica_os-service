@@ -9,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 
 from app import diagnostics, main, messaging
 from app.auth import Actor, get_actor
+from tests.fake_rabbit import FakeRabbit
 
 scenarios("features/order_saga.feature")
 
@@ -44,20 +45,18 @@ def ctx(monkeypatch):
         )(),
     )
 
+    broker = FakeRabbit()
+    monkeypatch.setattr(messaging, "_connection", broker.connection)
+    queues = {
+        "billing-commands": messaging.BILLING_COMMANDS_QUEUE,
+        "inventory-commands": messaging.INVENTORY_COMMANDS_QUEUE,
+        "os-events": messaging.OS_EVENTS_QUEUE,
+    }
+
     with mock_aws():
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
-        monkeypatch.setattr(messaging, "_client", None)
         monkeypatch.setattr(diagnostics, "_resource", None)
-        sqs = boto3.client("sqs", region_name="us-east-1")
-        urls = {
-            name: sqs.create_queue(QueueName=f"{name}.fifo", Attributes={"FifoQueue": "true"})["QueueUrl"]
-            for name in ("billing-commands", "inventory-commands", "os-events")
-        }
-        monkeypatch.setattr(main, "BILLING_COMMANDS_QUEUE_URL", urls["billing-commands"])
-        monkeypatch.setattr(main, "INVENTORY_COMMANDS_QUEUE_URL", urls["inventory-commands"])
-        monkeypatch.setattr(main, "OS_EVENTS_QUEUE_URL", urls["os-events"])
-
         ddb = boto3.client("dynamodb", region_name="us-east-1")
         ddb.create_table(
             TableName=diagnostics.DIAGNOSTICS_TABLE_NAME,
@@ -71,7 +70,13 @@ def ctx(monkeypatch):
             ],
             BillingMode="PAY_PER_REQUEST",
         )
-        yield {"client": TestClient(main.app), "factory": factory, "urls": urls, "catalog": catalog, "order_id": None}
+        yield {
+            "client": TestClient(main.app),
+            "factory": factory,
+            "queues": queues,
+            "catalog": catalog,
+            "order_id": None,
+        }
 
     main.app.dependency_overrides.clear()
     engine.dispose()
@@ -116,7 +121,7 @@ def open_order_with_parts(ctx, customer_id, vehicle_id, part_sku):
     ctx["order_id"] = res.json()["id"]
 
 
-@when("o relay da outbox publica os comandos pendentes no SQS")
+@when("o relay da outbox publica os comandos pendentes no RabbitMQ")
 def run_outbox_relay(ctx):
     with ctx["factory"]() as session:
         assert main.relay_outbox(session) >= 1
@@ -125,32 +130,30 @@ def run_outbox_relay(ctx):
 @when("o Billing processa a criação do orçamento e emite o evento QuoteCreated")
 def billing_creates_quote(ctx):
     cmds = []
-    messaging.process_batch(ctx["urls"]["billing-commands"], lambda t, p: cmds.append((t, p)), wait_seconds=0)
+    messaging.process_batch(ctx["queues"]["billing-commands"], lambda t, p: cmds.append((t, p)))
     assert cmds[0][0] == "CreateQuote"
     messaging.publish(
-        ctx["urls"]["os-events"],
+        ctx["queues"]["os-events"],
         "QuoteCreated",
         {"order_id": ctx["order_id"], "quote_id": "quote-bdd-1"},
-        group_id=ctx["order_id"],
     )
-    messaging.process_batch(ctx["urls"]["os-events"], main.consume_saga_event, wait_seconds=0)
+    messaging.process_batch(ctx["queues"]["os-events"], main.consume_saga_event)
 
 
 @when("o cliente aprova o orçamento gerando o evento QuoteApproved")
 def approve_quote_event(ctx):
-    messaging.publish(ctx["urls"]["os-events"], "QuoteApproved", {"order_id": ctx["order_id"]}, group_id=ctx["order_id"])
-    messaging.process_batch(ctx["urls"]["os-events"], main.consume_saga_event, wait_seconds=0)
+    messaging.publish(ctx["queues"]["os-events"], "QuoteApproved", {"order_id": ctx["order_id"]})
+    messaging.process_batch(ctx["queues"]["os-events"], main.consume_saga_event)
 
 
 @when(parsers.parse('o pagamento "{payment_id}" é confirmado gerando o evento PaymentConfirmed'))
 def confirm_payment_event(ctx, payment_id):
     messaging.publish(
-        ctx["urls"]["os-events"],
+        ctx["queues"]["os-events"],
         "PaymentConfirmed",
         {"order_id": ctx["order_id"], "payment_id": payment_id},
-        group_id=ctx["order_id"],
     )
-    messaging.process_batch(ctx["urls"]["os-events"], main.consume_saga_event, wait_seconds=0)
+    messaging.process_batch(ctx["queues"]["os-events"], main.consume_saga_event)
     with ctx["factory"]() as session:
         assert main.relay_outbox(session) == 1
 
@@ -158,10 +161,10 @@ def confirm_payment_event(ctx, payment_id):
 @when("o Inventory reserva as peças gerando o evento StockReserved")
 def reserve_stock_event(ctx):
     cmds = []
-    messaging.process_batch(ctx["urls"]["inventory-commands"], lambda t, p: cmds.append((t, p)), wait_seconds=0)
+    messaging.process_batch(ctx["queues"]["inventory-commands"], lambda t, p: cmds.append((t, p)))
     assert cmds[0][0] == "ReserveStock"
-    messaging.publish(ctx["urls"]["os-events"], "StockReserved", {"order_id": ctx["order_id"]}, group_id=ctx["order_id"])
-    messaging.process_batch(ctx["urls"]["os-events"], main.consume_saga_event, wait_seconds=0)
+    messaging.publish(ctx["queues"]["os-events"], "StockReserved", {"order_id": ctx["order_id"]})
+    messaging.process_batch(ctx["queues"]["os-events"], main.consume_saga_event)
 
 
 @then(parsers.parse('a OS deve estar no status "{expected_status}" e na fila de execução'))
@@ -230,7 +233,7 @@ def inventory_fails(ctx):
 @when("o Billing processa a compensação gerando o evento PaymentRefundRequested")
 def billing_compensates(ctx):
     cmds = []
-    messaging.process_batch(ctx["urls"]["billing-commands"], lambda t, p: cmds.append((t, p)), wait_seconds=0)
+    messaging.process_batch(ctx["queues"]["billing-commands"], lambda t, p: cmds.append((t, p)))
     assert any(c[0] == "RefundPayment" for c in cmds)
     with ctx["factory"]() as session:
         main.handle_saga_event(session, "PaymentRefundRequested", {"order_id": ctx["order_id"]})

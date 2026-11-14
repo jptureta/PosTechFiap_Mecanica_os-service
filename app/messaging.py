@@ -1,9 +1,4 @@
-"""Camada de mensageria sobre Amazon SQS (ou LocalStack em desenvolvimento).
-
-Todas as mensagens usam o envelope ``{"type", "payload", "correlation_id"}``.
-Filas ``.fifo`` recebem ``MessageGroupId`` (ordem por OS) e
-``MessageDeduplicationId`` (idempotência no envio).
-"""
+"""RabbitMQ transport for durable service commands and events."""
 
 import json
 import logging
@@ -12,96 +7,119 @@ import threading
 from typing import Callable
 from uuid import uuid4
 
-import boto3
+import pika
 
 from app import observability
 
 logger = logging.getLogger(__name__)
-
 MESSAGING_ENABLED = os.getenv("MESSAGING_ENABLED", "false").lower() == "true"
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-SQS_ENDPOINT_URL = os.getenv("SQS_ENDPOINT_URL") or None
-POLL_WAIT_SECONDS = int(os.getenv("SQS_POLL_WAIT_SECONDS", "10"))
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "")
+OS_EVENTS_QUEUE = os.getenv("OS_EVENTS_QUEUE", "oficina.os.events")
+BILLING_COMMANDS_QUEUE = os.getenv("BILLING_COMMANDS_QUEUE", "oficina.billing.commands")
+INVENTORY_COMMANDS_QUEUE = os.getenv("INVENTORY_COMMANDS_QUEUE", "oficina.inventory.commands")
 
-_client = None
+
+def _connection() -> pika.BlockingConnection:
+    if not RABBITMQ_URL:
+        raise RuntimeError("RABBITMQ_URL must be configured when messaging is enabled")
+    return pika.BlockingConnection(pika.URLParameters(RABBITMQ_URL))
 
 
-def get_client():
-    global _client
-    if _client is None:
-        _client = boto3.client("sqs", region_name=AWS_REGION, endpoint_url=SQS_ENDPOINT_URL)
-    return _client
+def _declare_queue(channel: pika.adapters.blocking_connection.BlockingChannel, queue_name: str) -> None:
+    dead_letter_queue = f"{queue_name}.dlq"
+    channel.queue_declare(queue=dead_letter_queue, durable=True)
+    channel.queue_declare(
+        queue=queue_name,
+        durable=True,
+        arguments={"x-dead-letter-routing-key": dead_letter_queue},
+    )
 
 
 def publish(
-    queue_url: str,
+    queue_name: str,
     message_type: str,
     payload: dict,
-    group_id: str,
-    dedup_id: str | None = None,
     correlation_id: str | None = None,
 ) -> str:
     cid = correlation_id or observability.get_correlation_id()
     body = json.dumps(
-        {
-            "type": message_type,
-            "payload": payload,
-            "correlation_id": cid,
-        },
+        {"type": message_type, "payload": payload, "correlation_id": cid},
         default=str,
     )
-    kwargs = {}
-    if queue_url.endswith(".fifo"):
-        kwargs["MessageGroupId"] = group_id
-        kwargs["MessageDeduplicationId"] = dedup_id or str(uuid4())
-    response = get_client().send_message(QueueUrl=queue_url, MessageBody=body, **kwargs)
+    connection = _connection()
+    try:
+        channel = connection.channel()
+        _declare_queue(channel, queue_name)
+        channel.confirm_delivery()
+        message_id = str(uuid4())
+        confirmed = channel.basic_publish(
+            exchange="",
+            routing_key=queue_name,
+            body=body,
+            properties=pika.BasicProperties(
+                content_type="application/json",
+                delivery_mode=2,
+                message_id=message_id,
+                correlation_id=cid,
+            ),
+            mandatory=True,
+        )
+        if not confirmed:
+            raise RuntimeError(f"RabbitMQ did not confirm delivery to {queue_name}")
+    finally:
+        if connection.is_open:
+            connection.close()
     observability.METRICS["events_published"][message_type] += 1
-    return response["MessageId"]
+    return message_id
 
 
-def receive(queue_url: str, max_messages: int = 10, wait_seconds: int | None = None) -> list[dict]:
-    response = get_client().receive_message(
-        QueueUrl=queue_url,
-        MaxNumberOfMessages=max_messages,
-        WaitTimeSeconds=POLL_WAIT_SECONDS if wait_seconds is None else wait_seconds,
-    )
-    return response.get("Messages", [])
-
-
-def delete(queue_url: str, receipt_handle: str) -> None:
-    get_client().delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
-
-
-def process_batch(queue_url: str, handler: Callable[[str, dict], None], wait_seconds: int | None = None) -> int:
-    """Consome um lote. Mensagem só é apagada se o handler concluir sem erro;
-    caso contrário volta à fila após o visibility timeout e, ao exceder
-    ``maxReceiveCount``, segue para a DLQ."""
+def process_batch(queue_name: str, handler: Callable[[str, dict], None], max_messages: int = 10) -> int:
+    connection = _connection()
     processed = 0
-    for message in receive(queue_url, wait_seconds=wait_seconds):
-        try:
-            envelope = json.loads(message["Body"])
-            observability.set_correlation_id(envelope.get("correlation_id"))
-            handler(envelope["type"], envelope["payload"])
-            observability.METRICS["events_consumed"][envelope["type"]] += 1
-        except Exception:
-            logger.exception("failed to process message %s from %s", message.get("MessageId"), queue_url)
-            continue
-        delete(queue_url, message["ReceiptHandle"])
-        processed += 1
+    try:
+        channel = connection.channel()
+        _declare_queue(channel, queue_name)
+        channel.basic_qos(prefetch_count=1)
+        for _ in range(max_messages):
+            method, _, body = channel.basic_get(queue=queue_name, auto_ack=False)
+            if method is None:
+                break
+            try:
+                envelope = json.loads(body)
+                message_type = envelope["type"]
+                payload = envelope["payload"]
+                if not isinstance(payload, dict):
+                    raise ValueError("message payload must be an object")
+                observability.set_correlation_id(envelope.get("correlation_id"))
+                handler(message_type, payload)
+            except Exception:
+                logger.exception("failed to process RabbitMQ message from %s", queue_name)
+                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                continue
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            observability.METRICS["events_consumed"][message_type] += 1
+            processed += 1
+    finally:
+        if connection.is_open:
+            connection.close()
     return processed
 
 
-def start_consumer(queue_url: str, handler: Callable[[str, dict], None]) -> threading.Event:
+def start_consumer(queue_name: str, handler: Callable[[str, dict], None]) -> threading.Event:
     stop = threading.Event()
 
-    def loop():
+    def loop() -> None:
         while not stop.is_set():
             try:
-                process_batch(queue_url, handler)
+                if process_batch(queue_name, handler) == 0:
+                    stop.wait(1)
             except Exception:
-                logger.exception("consumer loop error for %s", queue_url)
+                logger.exception("consumer loop error for %s", queue_name)
                 stop.wait(5)
 
-    threading.Thread(target=loop, name=f"consumer-{queue_url.rsplit('/', 1)[-1]}", daemon=True).start()
+    threading.Thread(
+        target=loop,
+        name=f"consumer-{queue_name.rsplit('.', 1)[-1]}",
+        daemon=True,
+    ).start()
     return stop
-

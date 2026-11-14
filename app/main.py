@@ -18,9 +18,6 @@ from app import diagnostics, messaging, observability
 from app.auth import Actor, get_actor
 
 logger = logging.getLogger(__name__)
-OS_EVENTS_QUEUE_URL = os.getenv("OS_EVENTS_QUEUE_URL", "")
-BILLING_COMMANDS_QUEUE_URL = os.getenv("BILLING_COMMANDS_QUEUE_URL", "")
-INVENTORY_COMMANDS_QUEUE_URL = os.getenv("INVENTORY_COMMANDS_QUEUE_URL", "")
 OUTBOX_RELAY_INTERVAL_SECONDS = float(os.getenv("OUTBOX_RELAY_INTERVAL_SECONDS", "2"))
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./os-service.db")
 BILLING_URL = os.getenv("BILLING_URL", "http://billing-service:8000").rstrip("/")
@@ -216,15 +213,15 @@ def order_document(order: Order) -> dict:
 
 
 COMMAND_QUEUES = {
-    "CreateQuote": lambda: BILLING_COMMANDS_QUEUE_URL,
-    "RefundPayment": lambda: BILLING_COMMANDS_QUEUE_URL,
-    "ReserveStock": lambda: INVENTORY_COMMANDS_QUEUE_URL,
-    "ReleaseStock": lambda: INVENTORY_COMMANDS_QUEUE_URL,
+    "CreateQuote": lambda: messaging.BILLING_COMMANDS_QUEUE,
+    "RefundPayment": lambda: messaging.BILLING_COMMANDS_QUEUE,
+    "ReserveStock": lambda: messaging.INVENTORY_COMMANDS_QUEUE,
+    "ReleaseStock": lambda: messaging.INVENTORY_COMMANDS_QUEUE,
 }
 
 
 def relay_outbox(db: Session) -> int:
-    """Publica no SQS os comandos pendentes da outbox (Transactional Outbox).
+    """Publica no RabbitMQ os comandos pendentes da outbox (Transactional Outbox).
 
     Em caso de falha a mensagem permanece PENDING e será reenviada no próximo ciclo.
     """
@@ -240,8 +237,6 @@ def relay_outbox(db: Session) -> int:
                 COMMAND_QUEUES[message.event_type](),
                 message.event_type,
                 message.payload,
-                group_id=message.aggregate_id,
-                dedup_id=message.id,
             )
         except Exception as exc:
             logger.exception("outbox publish failed for message %s", message.id)
@@ -314,12 +309,17 @@ def handle_saga_event(db: Session, event_type: str, payload: dict) -> None:
     if event_type == "QuoteCreated" and state == "QUOTE_PENDING":
         order.quote_id = payload["quote_id"]
         order.saga_state = "QUOTE_CREATED"
-    elif event_type == "QuoteApproved" and state == "QUOTE_CREATED":
+    elif event_type == "QuoteApproved" and state in {"QUOTE_PENDING", "QUOTE_CREATED"}:
+        order.quote_id = payload.get("quote_id") or order.quote_id
         order.saga_state = "AWAITING_PAYMENT"
         record_status(db, order, "AWAITING_PAYMENT", "Orçamento aprovado")
     elif event_type == "QuoteRejected" and state in {"QUOTE_PENDING", "QUOTE_CREATED"}:
         cancel_order(db, order, "Orçamento rejeitado pelo cliente")
-    elif event_type == "PaymentConfirmed" and state == "AWAITING_PAYMENT":
+    elif event_type == "PaymentConfirmed" and state in {"QUOTE_PENDING", "QUOTE_CREATED", "AWAITING_PAYMENT"}:
+        order.quote_id = payload.get("quote_id") or order.quote_id
+        if state != "AWAITING_PAYMENT":
+            order.saga_state = "AWAITING_PAYMENT"
+            record_status(db, order, "AWAITING_PAYMENT", "Pagamento confirmado")
         order.payment_id = payload["payment_id"]
         order.saga_state = "STOCK_RESERVING"
         record_outbox(
@@ -335,7 +335,7 @@ def handle_saga_event(db: Session, event_type: str, payload: dict) -> None:
                 ],
             },
         )
-    elif event_type == "PaymentFailed" and state in {"QUOTE_CREATED", "AWAITING_PAYMENT"}:
+    elif event_type == "PaymentFailed" and state in {"QUOTE_PENDING", "QUOTE_CREATED", "AWAITING_PAYMENT"}:
         cancel_order(db, order, "Pagamento recusado")
     elif event_type == "StockReserved" and state == "STOCK_RESERVING":
         order.saga_state = "COMPLETED"
@@ -395,7 +395,7 @@ def relay_loop(stop: threading.Event) -> None:
 async def lifespan(_: FastAPI):
     stops: list[threading.Event] = []
     if messaging.MESSAGING_ENABLED:
-        stops.append(messaging.start_consumer(OS_EVENTS_QUEUE_URL, consume_saga_event))
+        stops.append(messaging.start_consumer(messaging.OS_EVENTS_QUEUE, consume_saga_event))
         relay_stop = threading.Event()
         threading.Thread(target=relay_loop, args=(relay_stop,), name="outbox-relay", daemon=True).start()
         stops.append(relay_stop)
@@ -465,8 +465,7 @@ def create_order(
     )
     order.history.append(OrderHistory(new_status="QUOTE_PENDING", note="OS aberta"))
     db.add(order)
-    db.commit()
-    db.refresh(order)
+    db.flush()
     request = {
         "order_id": order.id,
         "customer_id": order.customer_id,
@@ -475,7 +474,10 @@ def create_order(
     if messaging.MESSAGING_ENABLED:
         record_outbox(db, order.id, "CreateQuote", request)
         db.commit()
+        db.refresh(order)
         return order_document(order)
+    db.commit()
+    db.refresh(order)
     try:
         response = httpx.post(
             f"{BILLING_URL}/quotes",
@@ -511,6 +513,15 @@ def retry_quote(
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     if order.saga_state == "QUOTE_CREATED":
+        return order_document(order)
+    if messaging.MESSAGING_ENABLED:
+        record_outbox(
+            db,
+            order.id,
+            "CreateQuote",
+            {"order_id": order.id, "customer_id": order.customer_id, "items": order.items},
+        )
+        db.commit()
         return order_document(order)
     try:
         response = httpx.post(
@@ -622,6 +633,17 @@ def payment_confirmed(
     if order.payment_id not in (None, payload.payment_id):
         raise HTTPException(status_code=409, detail="order already has a different payment")
     order.payment_id = payload.payment_id
+    if messaging.MESSAGING_ENABLED:
+        handle_saga_event(
+            db,
+            "PaymentConfirmed",
+            {"order_id": order.id, "payment_id": payload.payment_id},
+        )
+        return {
+            "order_id": order.id,
+            "status": order.status,
+            "saga_state": order.saga_state,
+        }
     try:
         response = httpx.post(
             f"{INVENTORY_URL}/reservations",
@@ -719,6 +741,15 @@ def retry_compensation(
         raise HTTPException(status_code=409, detail=f"order is not awaiting compensation (saga_state={order.saga_state})")
     if not order.payment_id:
         raise HTTPException(status_code=422, detail="order has no payment to compensate")
+    if messaging.MESSAGING_ENABLED:
+        record_outbox(
+            db,
+            order.id,
+            "RefundPayment",
+            {"order_id": order.id, "payment_id": order.payment_id},
+        )
+        db.commit()
+        return order_document(order)
     try:
         compensation = httpx.post(
             f"{BILLING_URL}/internal/payments/{order.payment_id}/compensate",

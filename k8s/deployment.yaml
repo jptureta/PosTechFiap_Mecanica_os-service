@@ -44,28 +44,13 @@ spec:
               value: http://inventory-service:8000
             - name: MESSAGING_ENABLED
               value: "true"
-            - name: AWS_REGION
-              value: us-east-1
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: microservices-secrets
+                  key: rabbitmq-url
             - name: DIAGNOSTICS_TABLE_NAME
               value: oficina-os-diagnostics-production
-            - name: OS_EVENTS_QUEUE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: microservices-secrets
-                  key: os-events-queue-url
-                  optional: true
-            - name: BILLING_COMMANDS_QUEUE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: microservices-secrets
-                  key: billing-commands-queue-url
-                  optional: true
-            - name: INVENTORY_COMMANDS_QUEUE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: microservices-secrets
-                  key: inventory-commands-queue-url
-                  optional: true
           readinessProbe:
             httpGet:
               path: /health

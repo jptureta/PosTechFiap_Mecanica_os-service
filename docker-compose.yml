@@ -17,8 +17,23 @@ services:
     ports:
       - "4566:4566"
     environment:
-      SERVICES: sqs,dynamodb
+      SERVICES: dynamodb
       AWS_DEFAULT_REGION: us-east-1
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: oficina
+      RABBITMQ_DEFAULT_PASS: oficina-local-only
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
   os-service:
     build: .
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
@@ -31,20 +46,20 @@ services:
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-only-change-me}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-local-only-change-me}
       JWT_ALGORITHM: HS256
-      MESSAGING_ENABLED: ${MESSAGING_ENABLED:-false}
+      MESSAGING_ENABLED: ${MESSAGING_ENABLED:-true}
+      RABBITMQ_URL: amqp://oficina:oficina-local-only@rabbitmq:5672/%2F
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
-      SQS_ENDPOINT_URL: http://localstack:4566
       DYNAMODB_ENDPOINT_URL: http://localstack:4566
       DIAGNOSTICS_TABLE_NAME: oficina-os-diagnostics
-      OS_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/oficina-os-events.fifo
-      BILLING_COMMANDS_QUEUE_URL: http://localstack:4566/000000000000/oficina-billing-commands.fifo
-      INVENTORY_COMMANDS_QUEUE_URL: http://localstack:4566/000000000000/oficina-inventory-commands.fifo
     depends_on:
       db:
         condition: service_healthy
       localstack:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
 volumes:
   os_data:
+  rabbitmq_data:

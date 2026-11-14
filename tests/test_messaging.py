@@ -1,11 +1,12 @@
-import boto3
+import json
+
 import pytest
-from moto import mock_aws
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import main, messaging
+from tests.fake_rabbit import FakeRabbit
 
 
 @pytest.fixture
@@ -18,24 +19,11 @@ def db():
 
 
 @pytest.fixture
-def sqs(monkeypatch):
-    with mock_aws():
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
-        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
-        monkeypatch.setattr(messaging, "_client", None)
-        client = boto3.client("sqs", region_name="us-east-1")
-        urls = {
-            name: client.create_queue(
-                QueueName=f"{name}.fifo",
-                Attributes={"FifoQueue": "true"},
-            )["QueueUrl"]
-            for name in ("billing-commands", "inventory-commands", "os-events")
-        }
-        monkeypatch.setattr(main, "BILLING_COMMANDS_QUEUE_URL", urls["billing-commands"])
-        monkeypatch.setattr(main, "INVENTORY_COMMANDS_QUEUE_URL", urls["inventory-commands"])
-        monkeypatch.setattr(main, "OS_EVENTS_QUEUE_URL", urls["os-events"])
-        yield urls
-        monkeypatch.setattr(messaging, "_client", None)
+def rabbit(monkeypatch):
+    broker = FakeRabbit()
+    monkeypatch.setattr(messaging, "_connection", broker.connection)
+    monkeypatch.setattr(messaging, "MESSAGING_ENABLED", True)
+    return broker
 
 
 def make_order(db, saga_state="QUOTE_PENDING", status="QUOTE_PENDING"):
@@ -56,38 +44,43 @@ def make_order(db, saga_state="QUOTE_PENDING", status="QUOTE_PENDING"):
 
 def outbox_types(db, order):
     return [
-        (m.event_type, m.status)
-        for m in db.scalars(
-            select(main.OutboxMessage).where(main.OutboxMessage.aggregate_id == order.id).order_by(main.OutboxMessage.created_at)
+        (message.event_type, message.status)
+        for message in db.scalars(
+            select(main.OutboxMessage)
+            .where(main.OutboxMessage.aggregate_id == order.id)
+            .order_by(main.OutboxMessage.created_at)
         )
     ]
 
 
-def test_publish_and_consume_roundtrip(sqs):
-    url = sqs["billing-commands"]
-    messaging.publish(url, "CreateQuote", {"order_id": "o1"}, group_id="o1", dedup_id="d1")
+def test_publish_and_consume_roundtrip(rabbit):
+    queue = messaging.BILLING_COMMANDS_QUEUE
+    messaging.publish(queue, "CreateQuote", {"order_id": "o1"}, correlation_id="corr-1")
+    envelope = json.loads(rabbit.queues[queue][0])
+    assert envelope == {
+        "type": "CreateQuote",
+        "payload": {"order_id": "o1"},
+        "correlation_id": "corr-1",
+    }
     received = []
-    count = messaging.process_batch(url, lambda t, p: received.append((t, p)), wait_seconds=0)
-    assert count == 1
+    assert messaging.process_batch(queue, lambda kind, payload: received.append((kind, payload))) == 1
     assert received == [("CreateQuote", {"order_id": "o1"})]
-    assert messaging.process_batch(url, lambda t, p: None, wait_seconds=0) == 0
+    assert messaging.process_batch(queue, lambda *_: None) == 0
 
 
-def test_failed_handler_keeps_message(sqs):
-    url = sqs["billing-commands"]
-    messaging.publish(url, "CreateQuote", {"order_id": "o1"}, group_id="o1")
+def test_failed_handler_moves_message_to_dead_letter_queue(rabbit):
+    queue = messaging.BILLING_COMMANDS_QUEUE
+    messaging.publish(queue, "CreateQuote", {"order_id": "o1"})
 
     def boom(*_):
-        raise RuntimeError("fail")
+        raise RuntimeError("handler failed")
 
-    assert messaging.process_batch(url, boom, wait_seconds=0) == 0
-    attrs = boto3.client("sqs", region_name="us-east-1").get_queue_attributes(
-        QueueUrl=url, AttributeNames=["ApproximateNumberOfMessagesNotVisible", "ApproximateNumberOfMessages"]
-    )["Attributes"]
-    assert int(attrs["ApproximateNumberOfMessagesNotVisible"]) + int(attrs["ApproximateNumberOfMessages"]) == 1
+    assert messaging.process_batch(queue, boom) == 0
+    assert len(rabbit.queues[queue]) == 0
+    assert len(rabbit.queues[queue + ".dlq"]) == 1
 
 
-def test_relay_publishes_pending_commands(db, sqs):
+def test_relay_publishes_pending_commands(db, rabbit):
     order = make_order(db)
     main.record_outbox(db, order.id, "CreateQuote", {"order_id": order.id})
     db.commit()
@@ -95,23 +88,23 @@ def test_relay_publishes_pending_commands(db, sqs):
     assert main.relay_outbox(db) == 0
     assert outbox_types(db, order) == [("CreateQuote", "PROCESSED")]
     received = []
-    messaging.process_batch(sqs["billing-commands"], lambda t, p: received.append(t), wait_seconds=0)
+    messaging.process_batch(messaging.BILLING_COMMANDS_QUEUE, lambda kind, _: received.append(kind))
     assert received == ["CreateQuote"]
 
 
-def test_relay_keeps_message_pending_on_failure(db, monkeypatch):
+def test_relay_keeps_message_pending_on_failure(db, rabbit, monkeypatch):
     order = make_order(db)
     main.record_outbox(db, order.id, "CreateQuote", {"order_id": order.id})
     db.commit()
 
     def broken(*args, **kwargs):
-        raise RuntimeError("sqs down")
+        raise RuntimeError("RabbitMQ unavailable")
 
     monkeypatch.setattr(main.messaging, "publish", broken)
     assert main.relay_outbox(db) == 0
     message = db.scalars(select(main.OutboxMessage)).one()
     assert message.status == "PENDING"
-    assert "sqs down" in message.error_message
+    assert "RabbitMQ unavailable" in message.error_message
 
 
 def test_happy_path_saga(db):
@@ -130,12 +123,31 @@ def test_happy_path_saga(db):
 
 def test_duplicate_and_out_of_order_events_are_ignored(db):
     order = make_order(db)
-    main.handle_saga_event(db, "PaymentConfirmed", {"order_id": order.id, "payment_id": "p1"})
+    main.handle_saga_event(db, "StockReserved", {"order_id": order.id})
     assert order.saga_state == "QUOTE_PENDING"
     main.handle_saga_event(db, "QuoteCreated", {"order_id": order.id, "quote_id": "q1"})
     main.handle_saga_event(db, "QuoteCreated", {"order_id": order.id, "quote_id": "q2"})
     assert order.quote_id == "q1"
     main.handle_saga_event(db, "Unknown", {"order_id": "missing"})
+
+
+def test_payment_events_tolerate_delayed_quote_events(db):
+    order = make_order(db)
+    main.handle_saga_event(
+        db,
+        "PaymentConfirmed",
+        {"order_id": order.id, "quote_id": "q-late", "payment_id": "p-late"},
+    )
+    main.handle_saga_event(db, "QuoteApproved", {"order_id": order.id, "quote_id": "q-late"})
+    main.handle_saga_event(
+        db,
+        "QuoteCreated",
+        {"order_id": order.id, "quote_id": "q-late"},
+    )
+    assert order.quote_id == "q-late"
+    assert order.payment_id == "p-late"
+    assert order.saga_state == "STOCK_RESERVING"
+    assert len(db.scalars(select(main.OutboxMessage).where(main.OutboxMessage.event_type == "ReserveStock")).all()) == 1
 
 
 def test_quote_rejected_cancels_order(db):
@@ -160,4 +172,3 @@ def test_stock_failure_triggers_refund_compensation(db):
     main.handle_saga_event(db, "PaymentRefundRequested", {"order_id": order.id})
     assert order.saga_state == "COMPENSATED" and order.status == "CANCELLED"
     assert ("COMPENSATION_COMPLETED", "PROCESSED") in outbox_types(db, order)
-

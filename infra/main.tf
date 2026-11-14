@@ -52,22 +52,39 @@ resource "aws_db_instance" "service" {
   auto_minor_version_upgrade = true
 }
 
-resource "aws_sqs_queue" "os_events_dlq" {
-  name                        = "oficina-os-events-${var.environment}-dlq.fifo"
-  fifo_queue                  = true
-  content_based_deduplication = true
-  message_retention_seconds   = 1209600
+resource "aws_security_group" "service_messaging" {
+  name        = "oficina-messaging-${var.environment}"
+  description = "RabbitMQ TLS access from the EKS node security group"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port       = 5671
+    to_port         = 5671
+    protocol        = "tcp"
+    security_groups = [var.eks_cluster_security_group_id]
+  }
 }
 
-resource "aws_sqs_queue" "os_events" {
-  name                        = "oficina-os-events-${var.environment}.fifo"
-  fifo_queue                  = true
-  content_based_deduplication = true
-  visibility_timeout_seconds  = 30
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.os_events_dlq.arn
-    maxReceiveCount     = 3
-  })
+resource "aws_mq_broker" "service_messaging" {
+  broker_name                = "oficina-messaging-${var.environment}"
+  engine_type                = "RabbitMQ"
+  engine_version             = var.rabbitmq_engine_version
+  host_instance_type         = var.rabbitmq_instance_type
+  deployment_mode            = "SINGLE_INSTANCE"
+  publicly_accessible        = false
+  auto_minor_version_upgrade = true
+  apply_immediately          = true
+  subnet_ids                 = [var.private_subnet_ids[0]]
+  security_groups            = [aws_security_group.service_messaging.id]
+
+  user {
+    username = var.rabbitmq_username
+    password = var.rabbitmq_password
+  }
+
+  logs {
+    general = true
+  }
 }
 
 resource "aws_dynamodb_table" "diagnostics" {

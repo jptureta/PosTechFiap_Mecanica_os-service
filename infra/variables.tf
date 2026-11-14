@@ -36,3 +36,22 @@ variable "db_instance_class" {
   type    = string
   default = "db.t4g.micro"
 }
+
+variable "rabbitmq_username" {
+  type = string
+}
+
+variable "rabbitmq_password" {
+  type      = string
+  sensitive = true
+}
+
+variable "rabbitmq_engine_version" {
+  type    = string
+  default = "3.13"
+}
+
+variable "rabbitmq_instance_type" {
+  type    = string
+  default = "mq.t3.micro"
+}
