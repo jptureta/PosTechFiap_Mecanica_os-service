@@ -42,6 +42,7 @@ flowchart LR
 2. **Controle de Compensação Determinístico**: Em falhas pós-pagamento (falha de reserva de estoque ou cancelamento durante diagnóstico/reparo), o orquestrador dispara na ordem exata a liberação de peças (`ReleaseStock`) e a solicitação de estorno (`RefundPayment`).
 3. **Prevenção de Acoplamento Cíclico**: `billing-service` e `inventory-service` não se conhecem; processam seus comandos e publicam eventos na fila compartilhada `oficina.os.events`.
 4. **Resiliência (DLQ + Outbox)**: Comandos são persistidos na tabela `outbox_messages` na mesma transação local da OS e publicados pelo relay (`relay_outbox`). Cada fila durável possui uma fila de dead-letter (`.dlq`).
+5. **Retentativa de compensação**: em cancelamentos com peças, `/orders/{id}/retry-compensation` reenvia primeiro `ReleaseStock`; só após `StockReleased` o orquestrador solicita `RefundPayment`. Como a liberação de estoque é idempotente, repetir a etapa após timeout ou falha de publicação não duplica o saldo.
 
 ### Estados da Saga e Compensações
 
@@ -84,6 +85,7 @@ Para executar a suíte de testes unitários + **BDD (`pytest-bdd`)** com verific
 ```bash
 uv sync --dev
 uv run pytest --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=80
+uv run ruff check --select E4,E7,E9,F app tests
 ```
 
 ### Evidência de Cobertura de Testes (87% > 80% exigido)
@@ -92,14 +94,14 @@ uv run pytest --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-un
 Name                   Stmts   Miss  Cover
 ------------------------------------------
 app/__init__.py            0      0   100%
-app/auth.py               26      0   100%
-app/diagnostics.py        24      0   100%
-app/main.py              548     89    84%
-app/messaging.py          58      3    95%
+app/auth.py               28      0   100%
+app/diagnostics.py        42      0   100%
+app/main.py              572     95    83%
+app/messaging.py          79      8    90%
 app/observability.py      58      1    98%
 ------------------------------------------
-TOTAL                    714     93    87%
-25 passed (incluindo 2 cenários BDD em tests/features/order_saga.feature)
+TOTAL                    779    104    87%
+27 passed (incluindo 2 cenários BDD em tests/features/order_saga.feature)
 ```
 
 ---
@@ -108,4 +110,4 @@ TOTAL                    714     93    87%
 
 - `infra/main.tf`: Provisiona instância **AWS RDS PostgreSQL 16**, broker privado **Amazon MQ for RabbitMQ** (TLS 5671) e tabela **Amazon DynamoDB** `oficina-os-diagnostics-<env>`. Grave o endpoint `rabbitmq_url` e as credenciais do broker no secret `microservices-secrets` (`rabbitmq-url`) consumido pelos três Deployments.
 - `k8s/`: Manifestos `deployment.yaml`, `migration-job.yaml` e `datadog-agent.yaml` + `datadog-monitors.yaml`.
-- `.github/workflows/ci-cd.yml`: Executa testes automatizados com gate de 80% de cobertura, análise estática no **SonarCloud**, validação Terraform (`fmt` + `validate`), build/push da imagem no GHCR e deploy automatizado no **Amazon EKS**.
+- `.github/workflows/ci-cd.yml`: Executa testes automatizados com gate de 80% de cobertura, lint obrigatório com **Ruff** e análise **SonarCloud** quando `SONAR_TOKEN` está configurado, validação Terraform (`fmt` + `validate`), build/push da imagem no GHCR e deploy automatizado no **Amazon EKS**.

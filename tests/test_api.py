@@ -184,11 +184,13 @@ def test_inventory_failure_requests_payment_compensation(monkeypatch):
 def test_retry_compensation_when_first_compensation_fails(monkeypatch):
     client, engine = client_for_test(monkeypatch)
     calls = []
+    compensation_order = []
     fail_compensation = True
 
     def post(url, **kwargs):
         nonlocal fail_compensation
         calls.append((url, kwargs))
+        compensation_order.append(f"POST {url}")
         if url.endswith("/reservations"):
             request = main.httpx.Request("POST", url)
             response = main.httpx.Response(409)
@@ -206,7 +208,12 @@ def test_retry_compensation_when_first_compensation_fails(monkeypatch):
             },
         )()
 
+    def delete(url, **kwargs):
+        compensation_order.append(f"DELETE {url}")
+        return type("Response", (), {"raise_for_status": lambda self: None})()
+
     monkeypatch.setattr(main.httpx, "post", post)
+    monkeypatch.setattr(main.httpx, "delete", delete)
     try:
         order = client.post(
             "/orders",
@@ -232,6 +239,10 @@ def test_retry_compensation_when_first_compensation_fails(monkeypatch):
         assert retry_res.status_code == 202
         assert retry_res.json()["saga_state"] == "COMPENSATED"
         assert retry_res.json()["status"] == "CANCELLED"
+        assert compensation_order[-2:] == [
+            f"DELETE {main.INVENTORY_URL}/reservations/{order['id']}",
+            f"POST {main.BILLING_URL}/internal/payments/payment-retry/compensate",
+        ]
     finally:
         main.app.dependency_overrides.clear()
         engine.dispose()

@@ -3,14 +3,13 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, Numeric, String, create_engine, select, text
+from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, create_engine, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -739,24 +738,36 @@ def retry_compensation(
         return order_document(order)
     if order.saga_state != "COMPENSATION_PENDING":
         raise HTTPException(status_code=409, detail=f"order is not awaiting compensation (saga_state={order.saga_state})")
-    if not order.payment_id:
-        raise HTTPException(status_code=422, detail="order has no payment to compensate")
+    has_parts = any(item.get("kind") == "PART" for item in order.items)
+    if not has_parts and not order.payment_id:
+        raise HTTPException(status_code=422, detail="order has no stock or payment to compensate")
     if messaging.MESSAGING_ENABLED:
-        record_outbox(
-            db,
-            order.id,
-            "RefundPayment",
-            {"order_id": order.id, "payment_id": order.payment_id},
-        )
+        if has_parts:
+            record_outbox(db, order.id, "ReleaseStock", {"order_id": order.id})
+        else:
+            record_outbox(
+                db,
+                order.id,
+                "RefundPayment",
+                {"order_id": order.id, "payment_id": order.payment_id},
+            )
         db.commit()
         return order_document(order)
     try:
-        compensation = httpx.post(
-            f"{BILLING_URL}/internal/payments/{order.payment_id}/compensate",
-            headers={"X-Internal-Token": INTERNAL_TOKEN},
-            timeout=5,
-        )
-        compensation.raise_for_status()
+        if has_parts:
+            release = httpx.delete(
+                f"{INVENTORY_URL}/reservations/{order.id}",
+                headers={"X-Internal-Token": INTERNAL_TOKEN},
+                timeout=5,
+            )
+            release.raise_for_status()
+        if order.payment_id:
+            compensation = httpx.post(
+                f"{BILLING_URL}/internal/payments/{order.payment_id}/compensate",
+                headers={"X-Internal-Token": INTERNAL_TOKEN},
+                timeout=5,
+            )
+            compensation.raise_for_status()
     except httpx.HTTPError as exc:
         logger.exception("retry compensation failed for order %s", order.id)
         record_outbox(

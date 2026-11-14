@@ -172,3 +172,23 @@ def test_stock_failure_triggers_refund_compensation(db):
     main.handle_saga_event(db, "PaymentRefundRequested", {"order_id": order.id})
     assert order.saga_state == "COMPENSATED" and order.status == "CANCELLED"
     assert ("COMPENSATION_COMPLETED", "PROCESSED") in outbox_types(db, order)
+
+
+def test_retry_compensation_releases_stock_before_requesting_refund(db, monkeypatch):
+    monkeypatch.setattr(messaging, "MESSAGING_ENABLED", True)
+    order = make_order(db, saga_state="COMPENSATION_PENDING", status="COMPENSATION_PENDING")
+    order.payment_id = "p1"
+    db.commit()
+
+    main.retry_compensation(
+        order.id,
+        actor=main.Actor(is_admin=True, customer_id=None),
+        db=db,
+    )
+
+    assert outbox_types(db, order)[-1] == ("ReleaseStock", "PENDING")
+    assert ("RefundPayment", "PENDING") not in outbox_types(db, order)
+
+    main.handle_saga_event(db, "StockReleased", {"order_id": order.id})
+
+    assert outbox_types(db, order)[-1] == ("RefundPayment", "PENDING")
