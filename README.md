@@ -110,4 +110,4 @@ TOTAL                    779    104    87%
 
 - `infra/main.tf`: Provisiona instância **AWS RDS PostgreSQL 16**, broker privado **Amazon MQ for RabbitMQ** (TLS 5671) e tabela **Amazon DynamoDB** `oficina-os-diagnostics-<env>`. Grave o endpoint `rabbitmq_url` e as credenciais do broker no secret `microservices-secrets` (`rabbitmq-url`) consumido pelos três Deployments.
 - `k8s/`: Manifestos `deployment.yaml`, `migration-job.yaml` e `datadog-agent.yaml` + `datadog-monitors.yaml`.
-- `.github/workflows/ci-cd.yml`: Executa testes automatizados com gate de 80% de cobertura, lint obrigatório com **Ruff** e análise **SonarCloud** quando `SONAR_TOKEN` está configurado, validação Terraform (`fmt` + `validate`), build/push da imagem no GHCR e deploy automatizado no **Amazon EKS**.
+- `.github/workflows/ci-cd.yml`: Executa testes automatizados com gate de 80% de cobertura, lint obrigatório com **Ruff** e análise **SonarCloud obrigatória com Quality Gate** (`SONAR_TOKEN` precisa estar nos secrets do repo), validação Terraform (`fmt` + `validate`), build/push da imagem no GHCR e deploy automatizado no **Amazon EKS**.
