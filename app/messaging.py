@@ -31,7 +31,9 @@ def _declare_queue(channel: pika.adapters.blocking_connection.BlockingChannel, q
     channel.queue_declare(
         queue=queue_name,
         durable=True,
-        arguments={"x-dead-letter-routing-key": dead_letter_queue},
+        # Sem x-dead-letter-exchange o RabbitMQ descarta a mensagem rejeitada.
+        # "" = exchange padrão, que entrega direto na fila com o nome da routing key.
+        arguments={"x-dead-letter-exchange": "", "x-dead-letter-routing-key": dead_letter_queue},
     )
 
 
